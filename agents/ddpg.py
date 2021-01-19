@@ -2,7 +2,10 @@ import numpy as np
 import random
 import tensorflow as tf
 
-from tensorflow.keras.layers import Input, Dense, Activation, Dropout, Concatenate, add, multiply
+from tensorflow.keras.layers import (
+    Input, Dense, Activation, Dropout, Concatenate, add, multiply, Conv2D, 
+    GlobalAveragePooling2D, Flatten
+)
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import backend as K
@@ -21,7 +24,7 @@ class DDPG():
         self.gamma = 0.99
         self.actor_learning_rate = 0.0007
         self.critic_learning_rate = 0.0002
-        self.n_s = env.observation_space.shape[0]
+        self.n_s = (96, 96, 5) # env.observation_space.shape
         self.n_a = env.action_space.shape[0]
         self.description = 'Deep Deterministic Policy Gradient'
         self.verbose = False
@@ -38,29 +41,47 @@ class DDPG():
         print('action low', self.action_low)
 
         # memory
-        self.memory_max = 50000
+        self.memory_max = 20000
 
-        self.reset()
+        # self.reset()
 
-    def create_actor_model(self):
+    def create_features(self):
         
         inputs = Input(shape=self.n_s)
-        x = Dense(32, activation='relu')(inputs)
-        x = Dense(32, activation='relu')(x)
-        x = Dense(1, activation='sigmoid')(x)
-        x = multiply([x, self.action_high-self.action_low])
-        x = add([x, self.action_low])
+        # x = Dense(32, activation='relu')(inputs)
+        x = Conv2D(16, (2,2), activation='relu')(inputs)
+        x = Conv2D(16, (2,2), activation='relu')(x)
+        x = Conv2D(16, (3,3), activation='relu')(x)
+        x = GlobalAveragePooling2D()(x)
+        x = Flatten()(x)
+        
+        return inputs, x
+        
+    def create_actor_model(self):
+        
+        x = self.features
+        x = Dense(16, activation='relu')(x)
+        x = Dense(3, activation='sigmoid')(x)
+        x = multiply([x, (self.action_high-self.action_low)[None,:]])
+        x = add([x, self.action_low[None,:]])
 
-        model = Model(inputs=inputs, outputs=x)
+        model = Model(inputs=self.inputs, outputs=x)
 
         return model
     
     def create_critic_model(self):
 
-        critic = Sequential()
-        critic.add(Dense(32, input_dim=self.n_s+self.n_a, activation='relu'))
-        critic.add(Dense(32, activation='relu'))
-        critic.add(Dense(1, activation='linear'))
+        # critic = Sequential()
+        # critic.add(Dense(32, input_dim=self.features.shape+self.n_a, activation='relu'))
+        # critic.add(Dense(32, activation='relu'))
+        # critic.add(Dense(1, activation='linear'))
+        # critic.compile(loss='mse', optimizer=Adam(lr=self.critic_learning_rate))
+        
+        action_input = Input(shape=self.n_a)
+        x = Concatenate(axis=1)([self.features, action_input])
+        x = Dense(16, activation='relu')(x)
+        x = Dense(1, activation='linear')(x)
+        critic = Model(inputs=[self.inputs, action_input], outputs=x)
         critic.compile(loss='mse', optimizer=Adam(lr=self.critic_learning_rate))
         return critic
 
@@ -70,8 +91,14 @@ class DDPG():
         self.step = 0
         self.memory = [] 
          
+        # Initialize features
+        self.inputs, self.features = self.create_features()
+        print('input layer', self.inputs)
+        print('features layer', self.features)
+        
         # Initialize actor model
         self.model = self.create_actor_model()
+        # print(self.model.summary())
 
         # Initialize actor target model
         self.model_target = self.create_actor_model()
@@ -79,7 +106,8 @@ class DDPG():
 
         # Initialize critic model
         self.critic = self.create_critic_model()
-
+        # print(self.critic.summary())
+        
         # Initialize critic target model
         self.critic_target = self.create_critic_model()
         self.critic_target.set_weights(self.critic.get_weights())
@@ -109,8 +137,8 @@ class DDPG():
         if self.verbose:
             print('model prediction', action)
         
-        action = np.clip(action + np.random.normal(0, self.sigma), self.env.action_space.low, self.env.action_space.high)
-        self.sigma = max(self.sigma * self.sigma_decay, self.sigma_min)
+        action = np.clip(action + np.random.normal([0, 0, 0], self.sigma), self.action_low, self.action_high)
+        self.sigma = np.max([self.sigma * self.sigma_decay, self.sigma_min], axis=0)
 
         if self.verbose:
             print(f'Action taken in state {state}: {action}')
@@ -121,8 +149,8 @@ class DDPG():
     def _build_actor_train_fn(self):
 
         actions = self.model.output
-        state_actions = Concatenate(axis=1)([self.model.input, actions])
-        q_values = self.critic(state_actions)
+        # state_actions = Concatenate(axis=1)([self.model.input, actions])
+        q_values = self.critic([self.model.input, actions])
 
         loss = -K.mean(q_values)
 
@@ -141,25 +169,26 @@ class DDPG():
         # get predictions
         s_vec = np.array([x[0] for x in batch])
         a_vec = np.array([x[1] for x in batch])
-        s_a_vec = np.array([x[2] for x in batch])
-        sp_vec = np.array([x[4] for x in batch])
+        sp_vec = np.array([x[3] for x in batch])
 
         ap_vec = self.model_target.predict(sp_vec)
-        q_sp_ap = self.critic_target.predict(np.concatenate([sp_vec, ap_vec], axis=1))
+        q_sp_ap = self.critic_target.predict([sp_vec, ap_vec])
 
-        q_s_a = self.critic.predict(s_a_vec)
+        q_s_a = self.critic.predict([s_vec, a_vec])
 
         # train critic
         for i in range(len(batch)): 
-            s, a, sa, r, s_prime, done = batch[i]
+            s, a, r, s_prime, done = batch[i]
             target = r
             if not done:
                 target += self.gamma * q_sp_ap[i]
             q_s_a[i] = target
 
-        self.critic.fit(s_a_vec, q_s_a, epochs = self.epochs, 
-                                        batch_size = self.nn_batch_size,
-                                        verbose = False)
+        self.critic.fit([s_vec, a_vec],
+                        q_s_a, 
+                        epochs = self.epochs, 
+                        batch_size = self.nn_batch_size,
+                        verbose = False)
 
         # train actor
         loss = self.actor_train_fn([s_vec])
@@ -169,9 +198,8 @@ class DDPG():
         # Store in memory
         if len(self.memory) > self.memory_max: self.memory.pop(0)
 
-        sa = np.concatenate([s, a])
-        self.memory.append([s, a, sa, r, s_prime, done])
-
+        # sa = [s, a]
+        self.memory.append([s, a, r, s_prime, done])
 
         if len(self.memory) > self.minibatch_sz:
 
